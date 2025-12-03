@@ -1,1 +1,98 @@
+var region = ee.Geometry.Rectangle([49.95, 31.11, 53.45, 33.78]); // W,S,E,N
+var baselineStart = 1980, baselineEnd = 2010;
+var WIN = 15;                                  // DOY window ±15
+var exportScale = 10000;                       // ~0.1°
+var assetPrefix = 'users/Sepehrss68a/TmaxThr_DOY95_1980_2010_10km'; // will add suffixes
+var era5D = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR');   // daily aggregates
+var era5H = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY');       // hourly (fallback for Tmax)
+function pad3(n){ n = parseInt(n,10); return ('000' + String(n)).slice(-3); }
+
+// add year DOY (clip DOY 366 → 365 for consistency)
+function addDateProps(img){
+  var d   = ee.Date(img.get('system:time_start'));
+  var doy = ee.Number(d.getRelative('day', 'year')).add(1).min(365);
+  return img.set({year: d.get('year'), month: d.get('month'), doy: doy});
+}
+function TmaxC(img){
+  var d  = ee.Date(img.get('system:time_start'));
+  var bn = img.bandNames();
+  var hasMax1 = bn.contains('maximum_2m_air_temperature');
+  var hasMax2 = bn.contains('temperature_2m_max');
+
+  var tK = ee.Image(ee.Algorithms.If(
+    hasMax1,
+    img.select('maximum_2m_air_temperature')
+    
+  ));
+
+  return tK.subtract(273.15).rename('Tmax')
+           .copyProperties(img, ['system:time_start']);
+}
+
+function dailyForRange(y0, y1){
+  var sd = ee.Date.fromYMD(ee.Number(y0).toInt(), 1, 1);
+  var ed = ee.Date.fromYMD(ee.Number(y1).toInt().add(1), 1, 1);
+  return era5D.filterDate(sd, ed)
+              .map(TmaxC)
+              .map(addDateProps)
+              .map(function(im){ return im.clip(region).toFloat(); });
+}
+
+// Baseline daily images (1980–2010)
+var base = dailyForRange(baselineStart, baselineEnd);
+
+// collect all baseline DOYs into a window around a targetdoy
+function windowDOY(d){
+  d = ee.Number(d);
+  var s = d.subtract(WIN), e = d.add(WIN);
+
+  var main = base.filter(ee.Filter.gte('doy', s.max(1)))
+                 .filter(ee.Filter.lte('doy', e.min(365)));
+
+  var wrapLow  = ee.ImageCollection(ee.Algorithms.If(
+    s.lt(1),
+    base.filter(ee.Filter.gte('doy', s.add(365))).filter(ee.Filter.lte('doy', 365)),
+    ee.ImageCollection([])));
+
+  var wrapHigh = ee.ImageCollection(ee.Algorithms.If(
+    e.gt(365),
+    base.filter(ee.Filter.gte('doy', 1)).filter(ee.Filter.lte('doy', e.subtract(365))),
+    ee.ImageCollection([])));
+
+  return main.merge(wrapLow).merge(wrapHigh);
+}
+
+// bBuild a stacked image //
+function buildThrStack(dStart, dEnd){
+  var ic = ee.ImageCollection(ee.List.sequence(dStart, dEnd).map(function(d){
+    var p95  = windowDOY(d).reduce(ee.Reducer.percentile([95])); // percentile of Tmax (°C)
+    var band = ee.String('thr_').cat(ee.Number(d).format('%03d'));
+    return p95.rename([band]).set('system:index', band);
+  }));
+  return ic.toBands().clip(region).toFloat();
+}
+
+/**export in chunks*/
+var chunks = [[1,60],[61,120],[121,180],[181,240],[241,300],[301,365]];
+
+chunks.forEach(function(r){
+  var d0 = r[0], d1 = r[1];
+  var img = buildThrStack(d0, d1);
+
+  //client-side zero-padded strings
+  var s0 = pad3(d0);
+  var s1 = pad3(d1);
+
+  var assetId = assetPrefix + '_d' + s0 + '_' + s1;
+
+  Export.image.toAsset({
+    image: img,
+    description: 'TmaxThr_DOY95_1980_2010_10km_d' + d0 + '_' + d1,
+    assetId: assetId,
+    region: region,
+    scale: exportScale,
+    maxPixels: 1e13
+  });
+});
+
 
